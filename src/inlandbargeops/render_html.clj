@@ -1,0 +1,442 @@
+(ns inlandbargeops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300)
+  for this repo: it previously had NO demo page and no generator at all.
+
+  This namespace drives the REAL actor stack -- `inlandbargeops.operation`
+  (the langgraph StateGraph) -> `inlandbargeops.governor`
+  (InlandWaterwayFreightGovernor) -> `inlandbargeops.store` (MemStore SSoT)
+  -- through a scenario built on this repo's OWN seeded ids
+  (`vessel-1`/`vessel-2`/`vessel-3`, `contractor-1`/`contractor-2` from
+  `inlandbargeops.store/demo-data`) and this repo's OWN closed op
+  allowlist (`inlandbargeops.governor/allowed-ops`). Every id, number,
+  disposition and hold reason on the rendered page is read back out of
+  the resulting store/ledger or out of the real graph run state -- none
+  of it is a literal typed into the markup.
+
+  The scenario deliberately reaches BOTH dispositions:
+    - clean auto-commit and human-approved commit paths, and
+    - six distinct HARD governor holds, each of which NEVER reaches a
+      human (`vessel-unverified` x2, `contractor-unverified`,
+      `effect-not-propose`, `scope-excluded`, `op-not-allowed`).
+
+  Determinism: no timestamps and no random ids in the page content, so
+  two consecutive runs from the same seed are byte-identical. The
+  governor gate table is derived from the live `governor`/`phase` vars
+  rather than transcribed, so it cannot drift away from the code.
+
+  Build-time invariant: `-main` REFUSES to write the file if the
+  resulting ledger contains zero `:governor-hold` facts (precedent:
+  cloud-itonami-isic-2513). A console that shows only happy paths would
+  silently stop demonstrating that the governor can actually say no.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [jp-go-dds.skin]
+            [langgraph.graph :as g]
+            [inlandbargeops.advisor :as advisor]
+            [inlandbargeops.governor :as governor]
+            [inlandbargeops.operation :as op]
+            [inlandbargeops.phase :as phase]
+            [inlandbargeops.store :as store]))
+
+;; ----------------------------- scenario -----------------------------
+
+(def ^:private coordinator "inland-logistics-coordinator-1")
+(def ^:private tow-captain "tow-captain-1")
+
+(defn- ctx
+  "The injected actor context -- `phase` is the rollout stage the
+  `inlandbargeops.phase` gate is asked to honour for this request."
+  [ph]
+  {:actor-id "coord-1" :actor-role :inland-logistics-coordinator :phase ph})
+
+(defn- run-step!
+  "Executes ONE coordination request through the real graph on its own
+  thread-id, resuming with a human approval when (and only when) the
+  actor actually interrupted for one. Returns the audit record this
+  page renders from -- all of it real graph output."
+  [runs actor tid request context approver]
+  (let [first-r (g/run* actor {:request request :context context} {:thread-id tid})
+        final-r (if (and approver (= :interrupted (:status first-r)))
+                  (g/run* actor {:approval {:status :approved :by approver}}
+                          {:thread-id tid :resume? true})
+                  first-r)]
+    (swap! runs conj {:thread-id    tid
+                      :request      request
+                      :phase        (:phase context)
+                      :first-status (:status first-r)
+                      :final-status (:status final-r)
+                      :disposition  (get-in final-r [:state :disposition])
+                      :audit        (get-in final-r [:state :audit])})
+    final-r))
+
+(defn- direct-actuation-advisor
+  "A compromised advisor that claims a DIRECT actuation instead of a
+  proposal. The governor's `effect-not-propose` check must HARD-hold it."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :effect :commit))))
+
+(defn- off-allowlist-advisor
+  "A drifted advisor proposing an op that was never on this actor's
+  closed allowlist. The governor's `op-not-allowed` check must
+  HARD-hold it."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :op :navigate-barge-directly))))
+
+(defn run-demo!
+  "Runs a fresh seeded store through every disposition this actor can
+  reach, and returns `{:db store :runs [..]}`.
+
+  Commit paths: a phase-1 shipment-record log (assisted-logging -- the
+  phase gate escalates even a governor-clean proposal, a human
+  coordinator approves), the same op at phase 3 (supervised-auto,
+  clean -> auto-commit), a dock/lock-scheduling proposal and a low-cost
+  maintenance order naming the VERIFIED contractor (both auto-commit),
+  a high-cost maintenance order (the governor's own `high-stakes?`
+  forces human sign-off at any phase), and a cargo-safety concern flag
+  (ALWAYS escalates -- approved by the tow captain).
+
+  HARD holds, none of which ever reaches a human: an unregistered
+  vessel, a registered-but-unverified vessel, a maintenance order
+  naming the unverified contractor, a proposal whose `:effect` is not
+  `:propose`, a proposal that drifted into the permanently-excluded
+  barge-navigation / safety-judgment-override scope, and a proposal
+  whose op is off the closed allowlist."
+  []
+  (let [db     (store/seed-db)
+        actor  (op/build db)
+        direct (op/build db {:advisor (direct-actuation-advisor)})
+        rogue  (op/build db {:advisor (off-allowlist-advisor)})
+        runs   (atom [])]
+
+    ;; -- commit paths ------------------------------------------------
+    (run-step! runs actor "s1-log-vessel-1-phase-1"
+               {:op :log-shipment-record :vessel-id "vessel-1"
+                :patch {:manifest-lines 42 :cargo-weight-tonnes 3200 :hazmat-class "none"}}
+               (ctx 1) coordinator)
+
+    (run-step! runs actor "s2-log-vessel-1-phase-3"
+               {:op :log-shipment-record :vessel-id "vessel-1"
+                :patch {:manifest-lines 30 :cargo-weight-tonnes 1800 :hazmat-class "none"}}
+               (ctx 3) nil)
+
+    (run-step! runs actor "s3-berth-vessel-2"
+               {:op :schedule-berth-operation :vessel-id "vessel-2"
+                :patch {:berth "dock-4" :lock-window "lock-7 06:00-08:00" :etd "18:00"}}
+               (ctx 3) nil)
+
+    (run-step! runs actor "s4-maintenance-vessel-2-low-cost"
+               {:op :coordinate-maintenance-order :vessel-id "vessel-2"
+                :patch {:item "routine hull inspection" :estimated-cost 1200.0
+                        :contractor-id "contractor-1"}}
+               (ctx 3) nil)
+
+    (run-step! runs actor "s5-maintenance-vessel-1-high-cost"
+               {:op :coordinate-maintenance-order :vessel-id "vessel-1"
+                :patch {:item "main engine overhaul" :estimated-cost 42000.0
+                        :contractor-id "contractor-1"}}
+               (ctx 3) coordinator)
+
+    (run-step! runs actor "s6-safety-concern-vessel-2"
+               {:op :flag-safety-concern :vessel-id "vessel-2"
+                :patch {:concern "hazmat placard mismatch on hold 3 manifest"
+                        :confidence 0.92}}
+               (ctx 3) tow-captain)
+
+    ;; -- HARD holds (a human is never consulted) ---------------------
+    (run-step! runs actor "s7-log-vessel-99-unregistered"
+               {:op :log-shipment-record :vessel-id "vessel-99"
+                :patch {:manifest-lines 0}}
+               (ctx 3) coordinator)
+
+    (run-step! runs actor "s8-log-vessel-3-unverified"
+               {:op :log-shipment-record :vessel-id "vessel-3"
+                :patch {:manifest-lines 10}}
+               (ctx 3) coordinator)
+
+    (run-step! runs actor "s9-maintenance-unverified-contractor"
+               {:op :coordinate-maintenance-order :vessel-id "vessel-1"
+                :patch {:item "drydock survey" :estimated-cost 3000.0
+                        :contractor-id "contractor-2"}}
+               (ctx 3) coordinator)
+
+    (run-step! runs direct "s10-advisor-claims-direct-actuation"
+               {:op :schedule-berth-operation :vessel-id "vessel-1"
+                :patch {:berth "dock-2" :lock-window "lock-3 08:00-09:00"}}
+               (ctx 3) coordinator)
+
+    (run-step! runs actor "s11-advisor-drifts-out-of-scope"
+               {:op :log-shipment-record :vessel-id "vessel-1"
+                :out-of-scope? true :patch {}}
+               (ctx 3) coordinator)
+
+    (run-step! runs rogue "s12-advisor-off-allowlist-op"
+               {:op :log-shipment-record :vessel-id "vessel-1"
+                :patch {:manifest-lines 5}}
+               (ctx 3) coordinator)
+
+    {:db db :runs @runs}))
+
+;; ----------------------------- derivation -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kw-name [k] (if (keyword? k) (name k) (str k)))
+
+(defn- fact-of [audit t] (last (filter #(= t (:t %)) audit)))
+
+(defn- hold-facts [ledger] (filter #(= :governor-hold (:t %)) ledger))
+(defn- commit-facts [ledger] (filter #(= :committed (:t %)) ledger))
+
+(defn- run-detail
+  "The human-readable outcome column for one scenario run -- every part
+  of it read back out of the real audit facts the graph emitted."
+  [{:keys [disposition audit]}]
+  (let [hold (fact-of audit :governor-hold)
+        req  (fact-of audit :approval-requested)
+        gr   (fact-of audit :approval-granted)]
+    (cond
+      hold
+      (str "<span class=\"critical\">HARD hold &middot; "
+           (esc (str/join ", " (map kw-name (:basis hold))))
+           "</span><br><span class=\"muted\">never reaches a human</span>")
+
+      gr
+      (str "<span class=\"ok\">approved &amp; committed</span><br>"
+           "<span class=\"muted\">escalated: " (esc (kw-name (:reason req)))
+           " &middot; approver: " (esc (:by gr)) "</span>")
+
+      (= :commit disposition)
+      "<span class=\"ok\">auto-committed</span><br><span class=\"muted\">governor clean, phase auto-eligible</span>"
+
+      req
+      (str "<span class=\"warn\">awaiting approval</span><br><span class=\"muted\">"
+           (esc (kw-name (:reason req))) "</span>")
+
+      :else "<span class=\"muted\">no disposition</span>")))
+
+(defn- run-row [{:keys [thread-id request phase first-status] :as r}]
+  (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td class=\"num\">%s</td><td>%s</td><td>%s</td></tr>"
+          (esc thread-id)
+          (esc (kw-name (:op request)))
+          (esc (:vessel-id request))
+          (esc phase)
+          (esc (kw-name first-status))
+          (run-detail r)))
+
+(defn- vessel-status [ledger vessel-id]
+  (let [f (last (filter #(= vessel-id (:vessel-id %)) ledger))]
+    (cond
+      (nil? f) "<span class=\"muted\">no activity</span>"
+      (= :committed (:t f)) "<span class=\"ok\">last op committed</span>"
+      (= :governor-hold (:t f))
+      (str "<span class=\"critical\">last op HARD-held &middot; "
+           (esc (str/join ", " (map kw-name (:basis f)))) "</span>")
+      :else (str "<span class=\"muted\">" (esc (kw-name (:t f))) "</span>"))))
+
+(defn- yes-no [b]
+  (if b "<span class=\"ok\">yes</span>" "<span class=\"critical\">no</span>"))
+
+(defn- vessel-row [ledger {:keys [vessel-id name registered? verified?]}]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc vessel-id) (esc name) (yes-no registered?) (yes-no verified?)
+          (vessel-status ledger vessel-id)))
+
+(defn- contractor-row [{:keys [contractor-id name registered? verified?]}]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc contractor-id) (esc name) (yes-no registered?) (yes-no verified?)))
+
+(defn- gate-row
+  "One row of the governor/phase gate table, DERIVED from the live
+  `governor`/`phase` vars so the page cannot drift away from the code."
+  [ph op]
+  (let [{:keys [writes auto]} (get phase/phases ph)
+        always? (contains? governor/always-escalate-ops op)
+        cell (cond
+               (not (contains? writes op))
+               "<span class=\"critical\">writes disabled at this phase</span>"
+               always?
+               "<span class=\"warn\">ALWAYS human approval &middot; never auto at any phase</span>"
+               (contains? auto op)
+               "<span class=\"ok\">auto-commit when governor-clean</span>"
+               :else
+               "<span class=\"warn\">human approval (not auto-eligible at this phase)</span>")]
+    (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+            (esc (kw-name op)) (yes-no (contains? writes op)) cell)))
+
+(defn- hold-row [{:keys [op vessel-id basis violations]}]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td><span class=\"critical\">%s</span></td><td>%s</td></tr>"
+          (esc (kw-name op)) (esc vessel-id)
+          (esc (str/join ", " (map kw-name basis)))
+          (esc (str/join " / " (map :detail violations)))))
+
+(defn- ledger-row [{:keys [t op vessel-id disposition basis]}]
+  (format "        <tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          (esc (kw-name t)) (esc (kw-name (or op :n-a))) (esc vessel-id)
+          (esc (kw-name (or disposition "")))
+          (esc (str/join ", " (map kw-name (or basis []))))))
+
+(defn- coordination-row [{:keys [op vessel-id value payload]}]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td></tr>"
+          (esc (kw-name op)) (esc vessel-id)
+          (esc (pr-str (into (sorted-map) value)))
+          (if-let [by (:approved-by payload)]
+            (str "<span class=\"ok\">" (esc by) "</span>")
+            "<span class=\"muted\">auto (no human in the loop)</span>")))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn render
+  "Renders the operator console from a store `db` that has already been
+  driven by `run-demo!`, plus the real per-run graph results."
+  [{:keys [db runs]}]
+  (let [ledger    (vec (store/ledger db))
+        coord-log (vec (store/coordination-log db))
+        holds     (vec (hold-facts ledger))
+        commits   (vec (commit-facts ledger))
+        ph        phase/default-phase
+        ops       (vec (sort-by kw-name governor/allowed-ops))]
+    (str
+     "<!doctype html>\n"
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+     "<title>cloud-itonami-isic-5022 &middot; inland freight water transport &mdash; Operator Console</title><style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Inland freight water transport (ISIC 5022) &mdash; Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample &middot; governor-gated &middot; port/logistics scheduling only</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>This run</h2>\n"
+     "    <p class=\"muted\">Build-time-generated by <code>inlandbargeops.render-html</code> (<code>clojure -M:dev:render-html</code>) by executing the real <code>inlandbargeops.operation</code> StateGraph against a freshly seeded <code>inlandbargeops.store</code>. Every value below was read back out of the resulting ledger — nothing on this page is transcribed.</p>\n"
+     "    <p>Coordination requests: <span class=\"num\">" (count runs) "</span>"
+     " &middot; committed: <span class=\"num ok\">" (count commits) "</span>"
+     " &middot; HARD governor holds: <span class=\"num critical\">" (count holds) "</span>"
+     " &middot; ledger facts: <span class=\"num\">" (count ledger) "</span></p>\n"
+     "    <p class=\"muted\">Confidence floor <span class=\"num\">" governor/confidence-floor
+     "</span> &middot; maintenance-order human-signoff threshold <span class=\"num\">"
+     governor/maintenance-cost-threshold "</span> (both read from <code>inlandbargeops.governor</code>).</p>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Registered vessels (barge / tow vessel / carrier)</h2>\n"
+     "    <p class=\"muted\">A proposal targeting a vessel that is not independently <code>:registered?</code> AND <code>:verified?</code> in this directory can never commit and can never even escalate — the governor re-derives this from the vessel record, never from the proposal's own claim.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Vessel</th><th>Name</th><th>Registered</th><th>Verified</th><th>Last ledger fact</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial vessel-row ledger) (store/all-vessel-records db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Registered maintenance contractors</h2>\n"
+     "    <p class=\"muted\">Same &ldquo;ground truth, not self-report&rdquo; discipline applied to the maintenance supply chain: a <code>:coordinate-maintenance-order</code> naming an unverified contractor is a HARD block.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Contractor</th><th>Name</th><th>Registered</th><th>Verified</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map contractor-row (store/all-contractor-records db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate at phase " ph " (" (:label (get phase/phases ph)) ")</h2>\n"
+     "    <p class=\"muted\">Derived at build time from <code>inlandbargeops.governor/allowed-ops</code>, <code>inlandbargeops.governor/always-escalate-ops</code> and <code>inlandbargeops.phase/phases</code>. Ops outside this closed allowlist are a scope violation by construction.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Writes enabled</th><th>Gate</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial gate-row ph) ops)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Coordination requests (this run)</h2>\n"
+     "    <p class=\"muted\">One row = one graph run on its own thread. <em>Graph status</em> is the status of the FIRST pass: <code>interrupted</code> means the actor paused and handed the decision to a human; <code>done</code> means it either auto-committed or was HARD-held without ever consulting one.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Thread</th><th>Op</th><th>Vessel</th><th>Phase</th><th>Graph status</th><th>Outcome</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map run-row runs)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>HARD governor holds (" (count holds) ")</h2>\n"
+     "    <p class=\"muted\">Permanent and un-overridable — no human approval can release these. They are written to the audit ledger and nothing touches the SSoT.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Vessel</th><th>Rule</th><th>Detail (from the governor)</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map hold-row holds)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Committed coordination log (" (count coord-log) ")</h2>\n"
+     "    <p class=\"muted\">The SSoT writes this run produced. <em>Approved by</em> is present only where a human actually signed off.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Vessel</th><th>Value</th><th>Approved by</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map coordination-row coord-log)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (" (count ledger) ")</h2>\n"
+     "    <p class=\"muted\">Append-only decision-fact log: which vessel a proposal targeted, which op, on what basis, committed or held.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Vessel</th><th>Disposition</th><th>Basis (cites on commit, violated rules on hold)</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map ledger-row ledger)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "</main>\n"
+     "<footer>\n"
+     "  <p>This actor coordinates inland-waterway port/logistics scheduling only. It never navigates or dispatches a barge or towboat, never operates lock infrastructure, and never finalizes a seaworthiness or cargo-load-safety clearance or overrides a tow captain's or lockmaster's safety judgment — those are permanent, un-overridable scope exclusions enforced by <code>inlandbargeops.governor</code>.</p>\n"
+     "  <p>Regenerate with <code>clojure -M:dev:render-html</code>. Output is deterministic: no timestamps, no random ids.</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out    (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        ledger (vec (store/ledger (:db result)))
+        holds  (count (hold-facts ledger))
+        commits (count (commit-facts ledger))]
+    ;; Build-time invariant: a console that cannot show the governor
+    ;; saying no is not a governed-actor console. Refuse to write it.
+    (when (zero? holds)
+      (throw (ex-info (str "refusing to write " out
+                           ": the scenario produced ZERO :governor-hold ledger facts. "
+                           "The operator console must demonstrate at least one HARD hold "
+                           "that never reaches a human.")
+                      {:out out :ledger-facts (count ledger)
+                       :governor-holds 0 :committed commits})))
+    (when (zero? commits)
+      (throw (ex-info (str "refusing to write " out
+                           ": the scenario produced ZERO :committed ledger facts, "
+                           "so the console cannot show a clean/approved path.")
+                      {:out out :ledger-facts (count ledger)
+                       :governor-holds holds :committed 0})))
+    (let [html (render result)]
+      (spit out html)
+      (println "wrote" out "-" (count ledger) "ledger facts,"
+               commits "committed," holds "HARD governor holds,"
+               (count (store/coordination-log (:db result))) "SSoT writes"))))

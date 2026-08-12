@@ -1,6 +1,14 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/langgraph
-        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}}
+        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}
+        ;; jp-go-digital-design-system (DADS) -- this workspace's BASE design
+        ;; system. Consumed as a git dep (not :local/root) so a standalone
+        ;; fork of this repo still resolves it. Used only by
+        ;; `inlandbargeops.render-html` at build time to style
+        ;; docs/samples/operator-console.html; the actor itself has no UI dep.
+        io.github.kotoba-lang/jp-go-digital-design-system
+        {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
+         :git/sha "83db99546eabc53613ae826ea41d1533a3c574af"}}
  :aliases
  {:dev {:override-deps
         {io.github.kotoba-lang/langgraph
@@ -8,6 +16,10 @@
          io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
   :run {:main-opts ["-m" "inlandbargeops.sim"]}
+  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; docs/samples/operator-console.html by executing the REAL actor
+  ;; (flagship checklist item 2, ADR-2607189300).
+  :render-html {:main-opts ["-m" "inlandbargeops.render-html"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
