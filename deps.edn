@@ -21,7 +21,7 @@
          io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
   :run {:main-opts ["-m" "inlandbargeops.sim"]}
-  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; kbb -M:dev:render-html [out-file] -> regenerate
   ;; docs/samples/operator-console.html by executing the REAL actor
   ;; (flagship checklist item 2, ADR-2607189300).
   :render-html {:main-opts ["-m" "inlandbargeops.render-html"]}
