@@ -1,6 +1,6 @@
 (ns inlandbargeops.advisor-test
   "Unit tests of `inlandbargeops.advisor` proposal generation."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [inlandbargeops.advisor :as adv]
             [inlandbargeops.store :as store]))
 
