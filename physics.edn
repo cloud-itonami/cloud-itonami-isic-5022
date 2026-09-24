@@ -1,0 +1,35 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": dockside cargo handling and lock-adjacent yard
+;; operations for inland freight water transport (ISIC 5022, barges and
+;; towboats). Physical work modelled here: a yard carrier moving palletised
+;; cargo from the barge berth up the quay ramp to the stacking yard, and the
+;; shore-side transfer of liquid cargo (diesel) from a tank barge through a
+;; cargo hose.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-5022"
+ :cases
+ [{:id :quay-ramp-pallet-carrier
+   :kind :transport
+   :procedure "yard carrier lifts palletised cargo at the barge berth and drives it up the quay ramp to the stacking yard"
+   :params {:mass-kg 1800.0 :distance-m 120.0 :v-max-mps 1.5 :a-max-mps2 0.3
+            :brake-decel-mps2 1.0 :drive-force-n 4000.0 :crr 0.02 :slope-deg 3.0
+            :cog-height-m 0.6 :support-half-length-m 0.7 :payload-cog-height-m 1.6
+            :max-time-s 1200.0}
+   :sweep {:param :payload-kg :values [250.0 500.0 1000.0 1500.0 2000.0 2500.0]}
+   :quantity :min-tipover-margin
+   :limit {:min 0.3 :basis "estimate: keep 30 % of the static longitudinal tip-over margin for a load carried high on a wet ramp"}
+   :boundary {:lo 100.0 :hi 4000.0}}
+  {:id :tank-barge-diesel-discharge
+   :kind :pipe-flow
+   :procedure "shore pump discharges diesel from a tank barge through an 80 m, 100 mm cargo hose up to the shore tank"
+   :params {:diameter-m 0.10 :length-m 80.0 :roughness-m 1.5e-5 :density-kg-m3 840.0
+            :viscosity-pa-s 3.5e-3 :pump-efficiency 0.65 :elevation-m 6.0}
+   :sweep {:param :q-m3s :values [0.005 0.010 0.020 0.030 0.040]}
+   :quantity :pump-power-w
+   :limit {:max 11000.0 :basis "estimate: 11 kW motor of a mobile shore transfer pump (hydraulic power at 65 % efficiency)"}
+   :boundary {:lo 0.001 :hi 0.08}}]}
