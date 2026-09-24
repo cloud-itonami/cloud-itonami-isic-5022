@@ -2,7 +2,7 @@
   "Pure unit tests of `inlandbargeops.governor/check` against hand-built
   proposals -- the fast, focused complement to `governor-contract-test`'s
   full-graph integration coverage."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [inlandbargeops.advisor :as adv]
             [inlandbargeops.governor :as gov]
             [inlandbargeops.store :as store]))
